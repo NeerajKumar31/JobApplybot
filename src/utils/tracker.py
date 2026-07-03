@@ -10,21 +10,27 @@ from src.models.job import Job, JobStatus
 class AppliedJobsTracker:
     """Persists the set of attempted jobs to disk so runs are idempotent.
 
-    The backing store is a simple JSON file. Each entry is keyed by LinkedIn
-    job_id and stores status, timestamps, and any error messages.
+    Keys are namespaced by source portal: "linkedin:JOB_ID" / "indeed:JOB_ID"
+    so the same numeric ID from two portals never collides.
     """
 
     def __init__(self, data_dir: Path) -> None:
         self._path = data_dir / "applied_jobs.json"
         self._records: dict[str, dict] = self._load()
 
-    def already_processed(self, job_id: str) -> bool:
+    @staticmethod
+    def make_key(source: str, job_id: str) -> str:
+        """Return the namespaced tracker key for a job."""
+        return f"{source}:{job_id}"
+
+    def already_processed(self, job_id: str, source: str = "linkedin") -> bool:
         """Return True only for jobs we should never retry.
 
         - applied / skipped(already_applied) → permanent, never re-attempt
         - failed / skipped(dry_run) → allow retry on next run
         """
-        rec = self._records.get(job_id)
+        key = self.make_key(source, job_id)
+        rec = self._records.get(key)
         if rec is None:
             return False
         status = rec.get("status", "")
@@ -34,8 +40,11 @@ class AppliedJobsTracker:
             return True
         return False
 
-    def record(self, job: Job) -> None:
-        self._records[job.job_id] = {
+    def record(self, job: Job, source: str = "linkedin") -> None:
+        key = self.make_key(source, job.job_id)
+        self._records[key] = {
+            "key": key,
+            "source": source,
             "job_id": job.job_id,
             "title": job.title,
             "company": job.company,
@@ -46,7 +55,7 @@ class AppliedJobsTracker:
             "updated_at": datetime.now().isoformat(),
         }
         self._save()
-        logger.debug(f"Tracked job {job.job_id} as {job.status.value}")
+        logger.debug(f"Tracked [{source}] job {job.job_id} as {job.status.value}")
 
     def summary(self) -> dict[str, int]:
         counts: dict[str, int] = {}

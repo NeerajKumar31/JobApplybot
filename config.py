@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     # LinkedIn
     linkedin_email: str
     linkedin_password: str
+    linkedin_enabled: bool = True
+
+    # Indeed
+    indeed_email: str = ""
+    indeed_password: str = ""
+    indeed_enabled: bool = False
 
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
