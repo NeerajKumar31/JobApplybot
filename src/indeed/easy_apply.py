@@ -6,12 +6,15 @@ import re
 from pathlib import Path
 
 from loguru import logger
-from playwright.async_api import FrameLocator, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import BrowserContext, FrameLocator, Page, TimeoutError as PlaywrightTimeoutError
 
 from src.models.applicant import Applicant
 from src.models.job import Job
 
 MAX_STEPS = 10
+
+# Indeed's dedicated apply domain (full-page flow, no iframe)
+_SMARTAPPLY_HOST = "smartapply.indeed.com"
 
 
 class IndeedApplyError(Exception):
@@ -38,38 +41,66 @@ class IndeedEasyApplyHandler:
         "div[id*='indeedapply'] iframe",
     ]
 
-    def __init__(self, page: Page, applicant: Applicant, llm=None) -> None:
+    def __init__(self, page: Page, applicant: Applicant, llm=None, context: BrowserContext | None = None) -> None:
         self._page      = page
         self._applicant = applicant
         self._llm       = llm
+        self._context   = context
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     async def apply(self, job: Job, resume_pdf_path: Path, cover_letter: str = "") -> None:
         """Complete the full Indeed Easy Apply flow for a given job."""
         await self._assert_not_already_applied(job)
+
+        # _open_apply_modal returns either:
+        #   FrameLocator  – modal opened inside an iframe on the current page
+        #   None          – apply opened as a full-page navigation (smartapply flow)
         frame = await self._open_apply_modal(job)
 
-        for step_num in range(1, MAX_STEPS + 1):
-            logger.debug(f"Indeed step {step_num}")
+        if frame is None:
+            # Smartapply / page-navigation flow — interact directly with self._page
+            await self._run_step_loop(job, resume_pdf_path, cover_letter, frame=None)
+        else:
+            await self._run_step_loop(job, resume_pdf_path, cover_letter, frame=frame)
 
-            if await self._is_submitted(frame):
+    async def _run_step_loop(
+        self,
+        job: Job,
+        resume_pdf_path: Path,
+        cover_letter: str,
+        frame,           # FrameLocator or None (page-based)
+    ) -> None:
+        """Drive the multi-step apply form to completion."""
+        # When frame is None we wrap self._page in a thin adapter so the rest of
+        # the code works identically for both iframe and page-based flows.
+        ctx = frame if frame is not None else _PageAsFrame(self._page)
+
+        for step_num in range(1, MAX_STEPS + 1):
+            logger.debug(f"Indeed step {step_num} (url={self._page.url})")
+
+            if await self._is_submitted(ctx):
                 logger.success(f"Indeed: application submitted for {job.title} @ {job.company}")
-                await self._close_modal()
+                if frame is not None:
+                    await self._close_modal()
                 return
 
-            await self._fill_step(frame, job, resume_pdf_path, cover_letter)
+            await self._fill_step(ctx, job, resume_pdf_path, cover_letter)
 
-            action = await self._detect_action(frame)
+            action = await self._detect_action(ctx)
             if action == "submit":
-                await self._click_in_frame(frame, "Submit", "Submit your application")
+                await self._click_in_frame(ctx,
+                    "Submit your application", "Submit", "Apply")
                 await asyncio.sleep(2)
-                if await self._is_submitted(frame):
+                if await self._is_submitted(ctx):
                     logger.success(f"Indeed: submitted {job.title} @ {job.company}")
-                    await self._close_modal()
+                    if frame is not None:
+                        await self._close_modal()
                     return
             elif action == "continue":
-                await self._click_in_frame(frame, "Continue", "Next step")
+                await self._click_in_frame(ctx,
+                    "Continue", "Next", "Continue to apply",
+                    "Review your application", "Next step")
             else:
                 screenshot = f"data/screenshots/indeed_stuck_{job.job_id}_step{step_num}.png"
                 await self._page.screenshot(path=screenshot)
@@ -99,10 +130,13 @@ class IndeedEasyApplyHandler:
 
     # ── Modal lifecycle ────────────────────────────────────────────────────────
 
-    async def _open_apply_modal(self, job: Job) -> FrameLocator:
-        """Click the Indeed Apply button and return the iframe FrameLocator."""
+    async def _open_apply_modal(self, job: Job):
+        """Click the Apply button and return the iframe FrameLocator.
+
+        Returns None when Indeed opens the apply flow as a full-page navigation
+        to smartapply.indeed.com (i.e. no iframe, just a new URL).
+        """
         try:
-            # Navigate to the job page first
             if job.url and "indeed.com" in job.url:
                 await self._page.goto(job.url, wait_until="domcontentloaded")
                 await asyncio.sleep(random.uniform(2, 3))
@@ -111,68 +145,105 @@ class IndeedEasyApplyHandler:
                 path=f"data/screenshots/indeed_before_apply_{job.job_id}.png"
             )
 
-            # Find and click the apply button
             apply_btn = await self._find_apply_button()
             if apply_btn is None:
                 raise PlaywrightTimeoutError("No visible Apply button found on Indeed page")
 
-            label = await apply_btn.get_attribute("aria-label") or ""
-            logger.debug(f"Indeed: clicking apply button: '{label}'")
-            await apply_btn.click()
-            await asyncio.sleep(2)
+            label = await apply_btn.get_attribute("aria-label") or await apply_btn.inner_text() or ""
+            logger.debug(f"Indeed: clicking apply button: '{label.strip()}'")
 
-            # Locate the iframe that Indeed loads the apply form in
-            frame = await self._find_apply_iframe()
+            # Watch for a new tab that some jobs open for external apply
+            async with self._page.context.expect_page(timeout=4_000) as new_page_info:
+                await apply_btn.click()
+            new_page = await new_page_info.value
+            await new_page.wait_for_load_state("domcontentloaded")
+            logger.info(f"Indeed: apply opened in new tab → {new_page.url}")
+            # Replace self._page so all subsequent interactions target the new tab
+            self._page = new_page
+            return None  # page-based flow in new tab
+
+        except Exception:
+            # No new tab opened — continue normally
+            pass
+
+        # Not a new tab — click and wait
+        apply_btn = await self._find_apply_button()
+        if apply_btn is None:
+            screenshot = f"data/screenshots/indeed_modal_fail_{job.job_id}.png"
+            await self._page.screenshot(path=screenshot)
+            raise IndeedApplyError(f"No Apply button for {job.job_id} — see {screenshot}")
+
+        await apply_btn.click()
+        await asyncio.sleep(3)
+
+        # Check for page navigation (smartapply full-page flow)
+        if _SMARTAPPLY_HOST in self._page.url or "/apply/" in self._page.url:
+            logger.info(f"Indeed: apply navigated to {self._page.url} — page-based flow")
+            return None
+
+        # Look for the IndeedApply iframe
+        frame = await self._find_apply_iframe()
+        if frame is not None:
             logger.debug("Indeed: apply iframe located")
             return frame
 
-        except PlaywrightTimeoutError as e:
-            screenshot = f"data/screenshots/indeed_modal_fail_{job.job_id}.png"
-            await self._page.screenshot(path=screenshot)
-            raise IndeedApplyError(
-                f"Could not open Indeed apply modal for {job.job_id}"
-            ) from e
+        # Still on the original page with no iframe — log what we see
+        screenshot = f"data/screenshots/indeed_modal_fail_{job.job_id}.png"
+        await self._page.screenshot(path=screenshot)
+        raise IndeedApplyError(
+            f"Could not open Indeed apply modal for {job.job_id} — see {screenshot}"
+        )
 
     async def _find_apply_button(self):
-        """Find the first visible apply button on the Indeed job page."""
+        """Find the first visible Apply button on the Indeed job detail panel."""
         strategies = [
             self._page.locator("button#indeedApplyButton"),
+            self._page.locator("[data-testid='indeedApplyButton']"),
             self._page.locator("a[data-testid='apply-button-container']"),
             self._page.get_by_role("button", name="Apply now"),
             self._page.get_by_role("link",   name="Apply now"),
+            self._page.get_by_role("button", name="Apply"),
             self._page.locator("button.indeed-apply-button"),
             self._page.locator("[class*='applyButton']"),
             self._page.locator(".indeed-apply-widget button"),
         ]
         for loc in strategies:
-            count = await loc.count()
-            for i in range(count):
-                btn = loc.nth(i)
-                if await btn.is_visible():
-                    return btn
+            try:
+                count = await loc.count()
+                for i in range(count):
+                    btn = loc.nth(i)
+                    if await btn.is_visible():
+                        return btn
+            except Exception:
+                continue
         return None
 
-    async def _find_apply_iframe(self) -> FrameLocator:
-        """Wait for and return the IndeedApply iframe FrameLocator."""
-        for sel in self._IFRAME_SELECTORS:
+    async def _find_apply_iframe(self) -> FrameLocator | None:
+        """Wait for and return the IndeedApply iframe FrameLocator, or None."""
+        selectors = [
+            "iframe[id*='indeedapply']",
+            "iframe[title*='Apply']",
+            "iframe[name*='apply']",
+            "iframe[src*='indeedapply']",
+            "iframe[src*='indeed.com/apply']",
+            "iframe[src*='smartapply']",
+            "div[id*='indeedapply'] iframe",
+            "div[class*='indeed-apply'] iframe",
+        ]
+        for sel in selectors:
             try:
-                iframe_el = self._page.locator(sel)
-                await iframe_el.wait_for(state="attached", timeout=10_000)
+                iframe_el = self._page.locator(sel).first
+                await iframe_el.wait_for(state="attached", timeout=8_000)
                 frame = self._page.frame_locator(sel)
-                # Verify the iframe has content
-                await frame.locator("body").wait_for(state="visible", timeout=8_000)
+                await frame.locator("body").wait_for(state="visible", timeout=6_000)
+                logger.debug(f"Indeed: iframe found via '{sel}'")
                 return frame
             except PlaywrightTimeoutError:
                 continue
-
-        # Fallback: find any iframe that appeared after the click
-        iframe_el = self._page.locator("iframe").last
-        if await iframe_el.count() > 0:
-            src = await iframe_el.get_attribute("src") or ""
-            logger.debug(f"Indeed: using fallback iframe src={src}")
-            return self._page.frame_locator("iframe:last-of-type")
-
-        raise PlaywrightTimeoutError("IndeedApply iframe not found after clicking Apply")
+            except Exception as e:
+                logger.debug(f"Indeed: iframe selector '{sel}' error: {e}")
+                continue
+        return None
 
     async def _close_modal(self) -> None:
         try:
@@ -188,35 +259,62 @@ class IndeedEasyApplyHandler:
 
     # ── Step detection ─────────────────────────────────────────────────────────
 
-    async def _is_submitted(self, frame: FrameLocator) -> bool:
+    async def _is_submitted(self, ctx) -> bool:
         try:
-            indicators = frame.locator(
+            indicators = ctx.locator(
                 "h1:has-text('application was sent'), "
                 "h2:has-text('application was sent'), "
-                "[class*='success'], "
-                "p:has-text('Your application has been submitted')"
+                "h1:has-text('Application submitted'), "
+                "h2:has-text('Application submitted'), "
+                "[class*='PostApply'], "
+                "[data-testid*='success'], "
+                "p:has-text('Your application has been submitted'), "
+                "p:has-text('application has been sent')"
             )
             return await indicators.count() > 0
         except Exception:
             return False
 
-    async def _detect_action(self, frame: FrameLocator) -> str:
+    async def _detect_action(self, ctx) -> str:
         """Return 'submit', 'continue', or 'unknown' based on visible buttons."""
-        for label in ["Submit your application", "Submit"]:
+        submit_labels = [
+            "Submit your application", "Submit application",
+            "Submit", "Apply", "Send application",
+        ]
+        continue_labels = [
+            "Continue", "Next", "Continue to apply",
+            "Review your application", "Next step", "Save and continue",
+        ]
+
+        for label in submit_labels:
             try:
-                btn = frame.get_by_role("button", name=label)
+                btn = ctx.get_by_role("button", name=label)
                 if await btn.count() > 0 and not await btn.first.is_disabled():
+                    logger.debug(f"Indeed: detected submit button '{label}'")
                     return "submit"
             except Exception:
                 pass
 
-        for label in ["Continue", "Next", "Review your application"]:
+        for label in continue_labels:
             try:
-                btn = frame.get_by_role("button", name=label)
+                btn = ctx.get_by_role("button", name=label)
                 if await btn.count() > 0 and not await btn.first.is_disabled():
+                    logger.debug(f"Indeed: detected continue button '{label}'")
                     return "continue"
             except Exception:
                 pass
+
+        # Last resort: any enabled submit-type button
+        try:
+            btn = ctx.locator("button[type='submit']").first
+            if await btn.count() > 0 and not await btn.is_disabled():
+                txt = (await btn.inner_text()).strip()
+                logger.debug(f"Indeed: fallback submit button text='{txt}'")
+                return "submit" if any(
+                    w in txt.lower() for w in ("submit", "apply", "send")
+                ) else "continue"
+        except Exception:
+            pass
 
         return "unknown"
 
@@ -224,14 +322,14 @@ class IndeedEasyApplyHandler:
 
     async def _fill_step(
         self,
-        frame: FrameLocator,
+        ctx,
         job: Job,
         resume_path: Path,
         cover_letter: str,
     ) -> None:
         """Fill whatever form elements are visible on the current step."""
         # Resume upload
-        file_input = frame.locator("input[type='file']")
+        file_input = ctx.locator("input[type='file']")
         if await file_input.count() > 0:
             await file_input.set_input_files(str(resume_path.resolve()))
             await asyncio.sleep(1.5)
@@ -239,12 +337,12 @@ class IndeedEasyApplyHandler:
             return
 
         # Contact info fields
-        await self._fill_contact_fields(frame)
+        await self._fill_contact_fields(ctx)
 
         # Screening questions
-        await self._fill_questions(frame, job, cover_letter)
+        await self._fill_questions(ctx, job, cover_letter)
 
-    async def _fill_contact_fields(self, frame: FrameLocator) -> None:
+    async def _fill_contact_fields(self, ctx) -> None:
         field_map = {
             "first": self._applicant.first_name,
             "last":  self._applicant.last_name,
@@ -253,7 +351,7 @@ class IndeedEasyApplyHandler:
         }
         for keyword, value in field_map.items():
             try:
-                field = frame.locator(
+                field = ctx.locator(
                     f"input[name*='{keyword}' i], "
                     f"input[id*='{keyword}' i], "
                     f"input[placeholder*='{keyword}' i]"
@@ -267,11 +365,11 @@ class IndeedEasyApplyHandler:
                 logger.debug(f"Indeed: could not fill {keyword}: {e}")
 
     async def _fill_questions(
-        self, frame: FrameLocator, job: Job, cover_letter: str
+        self, ctx, job: Job, cover_letter: str
     ) -> None:
-        """Answer screening questions inside the apply iframe."""
+        """Answer screening questions inside the apply form."""
         # Radio buttons — prefer "Yes" for boolean questions
-        radios = frame.locator("input[type='radio'][value='Yes'], label:has-text('Yes')")
+        radios = ctx.locator("input[type='radio'][value='Yes'], label:has-text('Yes')")
         for i in range(await radios.count()):
             try:
                 await radios.nth(i).click()
@@ -280,7 +378,7 @@ class IndeedEasyApplyHandler:
                 pass
 
         # Dropdowns
-        selects = frame.locator("select")
+        selects = ctx.locator("select")
         for i in range(await selects.count()):
             try:
                 sel = selects.nth(i)
@@ -292,26 +390,26 @@ class IndeedEasyApplyHandler:
                 pass
 
         # Text inputs
-        text_inputs = frame.locator("input[type='text'], input[type='number']")
+        text_inputs = ctx.locator("input[type='text'], input[type='number']")
         for i in range(await text_inputs.count()):
             try:
                 field = text_inputs.nth(i)
                 if await field.input_value():
                     continue
-                label = await self._get_label(frame, field)
+                label = await self._get_label(ctx, field)
                 answer = await self._get_answer(label, "text", job)
                 await field.fill(answer)
             except Exception:
                 pass
 
         # Textareas (cover letter / open-ended)
-        textareas = frame.locator("textarea")
+        textareas = ctx.locator("textarea")
         for i in range(await textareas.count()):
             try:
                 ta = textareas.nth(i)
                 if await ta.input_value():
                     continue
-                label = await self._get_label(frame, ta)
+                label = await self._get_label(ctx, ta)
                 if cover_letter and any(
                     kw in label.lower() for kw in ["cover", "motivation", "why"]
                 ):
@@ -324,29 +422,29 @@ class IndeedEasyApplyHandler:
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
-    async def _click_in_frame(self, frame: FrameLocator, *labels: str) -> None:
+    async def _click_in_frame(self, ctx, *labels: str) -> None:
         for label in labels:
             try:
-                btn = frame.get_by_role("button", name=label)
+                btn = ctx.get_by_role("button", name=label)
                 if await btn.count() > 0:
                     await btn.first.click()
                     await asyncio.sleep(random.uniform(0.5, 1.2))
                     return
             except Exception:
                 pass
-        # Fallback: try submit-type button
+        # Fallback: any enabled submit-type button
         try:
-            btn = frame.locator("button[type='submit']").first
+            btn = ctx.locator("button[type='submit']").first
             if await btn.count() > 0:
                 await btn.click()
         except Exception:
             pass
 
-    async def _get_label(self, frame: FrameLocator, input_locator) -> str:
+    async def _get_label(self, ctx, input_locator) -> str:
         try:
             input_id = await input_locator.get_attribute("id") or ""
             if input_id:
-                lbl = frame.locator(f"label[for='{input_id}']")
+                lbl = ctx.locator(f"label[for='{input_id}']")
                 if await lbl.count() > 0:
                     return (await lbl.first.inner_text()).strip()
         except Exception:
@@ -388,3 +486,18 @@ Do NOT include preamble. Answer (raw value only):\
                 return "120000"
             return "1"
         return "Please refer to my resume for details."
+
+
+class _PageAsFrame:
+    """Thin adapter so `Page` can be used anywhere a `FrameLocator` is expected.
+
+    FrameLocator and Page share the same `.locator()` / `.get_by_role()` API,
+    so we just forward every attribute access to the underlying Page object.
+    This lets `_run_step_loop` work identically for both iframe and page flows.
+    """
+
+    def __init__(self, page: Page) -> None:
+        self._page = page
+
+    def __getattr__(self, name: str):
+        return getattr(self._page, name)

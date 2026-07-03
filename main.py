@@ -223,12 +223,17 @@ async def run_indeed(
         )
         page = await context.new_page()
 
-        auth = IndeedAuth(page, context)
-        await auth.login_with_session(
-            settings.indeed_email,
-            settings.indeed_password,
-            settings.data_dir / "indeed_cookies.json",
-        )
+        try:
+            auth = IndeedAuth(page, context)
+            await auth.login_with_session(
+                settings.indeed_email,
+                settings.indeed_password,
+                settings.data_dir / "indeed_cookies.json",
+            )
+        except Exception as e:
+            logger.error(f"Indeed: login failed — {e}")
+            await browser.close()
+            return 0
 
         searcher = IndeedJobSearcher(page)
         jobs = await searcher.search(
@@ -248,7 +253,7 @@ async def run_indeed(
 
         rewriter   = ResumeRewriter(ollama)
         cover_gen  = CoverLetterGenerator(ollama) if settings.generate_cover_letter else None
-        ea_handler = IndeedEasyApplyHandler(page, applicant, llm=ollama)
+        ea_handler = IndeedEasyApplyHandler(page, applicant, llm=ollama, context=context)
 
         for job in jobs:
             if tracker.already_processed(job.job_id, source="indeed"):

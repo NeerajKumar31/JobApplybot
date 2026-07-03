@@ -332,15 +332,26 @@ class EasyApplyHandler:
         logger.debug("Filled contact info")
 
     async def _upload_resume(self, resume_path: Path) -> None:
-        """Upload the tailored PDF resume via the hidden file input."""
-        modal = self._page.locator(self._MODAL_SELECTOR)
-        file_input = modal.locator("input[type='file']")
+        """Upload the tailored PDF resume via the hidden file input.
 
-        if await file_input.count() == 0:
+        LinkedIn shows two file inputs on some steps: one for the resume and one
+        for a cover letter.  Target the resume input specifically by aria-label,
+        falling back to the first file input if no labelled one is found.
+        """
+        modal = self._page.locator(self._MODAL_SELECTOR)
+
+        # Prefer the input labelled "Upload resume" to avoid the cover-letter input
+        resume_input = modal.locator("input[type='file'][id*='resume']")
+        if await resume_input.count() == 0:
+            resume_input = modal.get_by_label("Upload resume", exact=True)
+        if await resume_input.count() == 0:
+            resume_input = modal.locator("input[type='file']").first
+
+        if await resume_input.count() == 0:
             logger.warning("No file input on resume step — skipping upload")
             return
 
-        await file_input.set_input_files(str(resume_path.resolve()))
+        await resume_input.set_input_files(str(resume_path.resolve()))
         await asyncio.sleep(1.5)
         logger.debug(f"Uploaded resume: {resume_path.name}")
 
@@ -427,13 +438,18 @@ class EasyApplyHandler:
             label = labels.nth(i)
             text = (await label.inner_text()).strip().lower()
             if text == answer.lower():
+                # Always click the <label> — it intercepts pointer events on the <input>
                 await label.click()
                 logger.debug(f"Radio '{question}' → '{answer}'")
                 return
-        # Default: click first radio option
-        first = group.locator("input[type='radio']").first
-        if await first.count() > 0:
-            await first.click()
+        # Default: click the label of the first radio option (not the input itself)
+        first_label = group.locator("label").first
+        if await first_label.count() > 0:
+            await first_label.click()
+        else:
+            first_input = group.locator("input[type='radio']").first
+            if await first_input.count() > 0:
+                await first_input.click(force=True)
 
     async def _handle_select(self, group, question: str, job: Job) -> None:
         select = group.locator("select").first

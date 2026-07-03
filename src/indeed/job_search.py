@@ -41,6 +41,8 @@ class IndeedJobSearcher:
         await self._page.screenshot(path="data/screenshots/indeed_search_page.png")
         logger.debug("Indeed: search page screenshot → data/screenshots/indeed_search_page.png")
 
+        await self._dismiss_popups()
+
         jobs: list[Job] = []
         seen_ids: set[str] = set()
         page_num = 0
@@ -98,10 +100,37 @@ class IndeedJobSearcher:
 
         return f"{_JOBS_BASE}?{urllib.parse.urlencode(params)}"
 
+    # ── Popup dismissal ────────────────────────────────────────────────────────
+
+    async def _dismiss_popups(self) -> None:
+        """Close any modal dialogs (ToS updates, cookie consent, etc.)."""
+        popup_selectors = [
+            # "Accept Terms" / ToS update modal
+            "button:has-text('Accept Terms')",
+            "button:has-text('Accept')",
+            # Cookie consent
+            "button:has-text('Accept all')",
+            "button:has-text('Accept All')",
+            # Generic dismiss
+            "button[aria-label='Close']",
+            "button:has-text('Close')",
+            "button:has-text('Dismiss')",
+        ]
+        for sel in popup_selectors:
+            try:
+                btn = self._page.locator(sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click()
+                    logger.debug(f"Indeed: dismissed popup via '{sel}'")
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
+
     # ── Page scraping ──────────────────────────────────────────────────────────
 
     async def _scrape_page(self, seen_ids: set[str]) -> list[Job]:
         """Scrape all job cards on the current results page."""
+        await self._dismiss_popups()
         # Scroll to trigger lazy loading
         await self._page.evaluate("window.scrollBy(0, 600)")
         await asyncio.sleep(1)
@@ -174,10 +203,6 @@ class IndeedJobSearcher:
                 "div[data-testid='text-location']",
                 "[class*='companyLocation']",
             ])
-
-            is_easy_apply = await self._card_has_easy_apply(card)
-            if not is_easy_apply:
-                return None
 
             # Click card to load detail and get description + URL
             await card.click()

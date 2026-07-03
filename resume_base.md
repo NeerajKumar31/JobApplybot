@@ -61,12 +61,12 @@ Mobile and Web Application Developer with 9+ years of experience building cross-
 
 ## Skills
 
-**Frameworks & Libraries:** Ionic V3/V5, Angular 5/6/8/12/14, React Native, Cordova, AngularJS  
+**Frameworks & Libraries:** Ionic V3 to V7, Angular 5/6/8/12/14, React Native, Native Android, Cordova, Flutter  
 **Languages:** TypeScript, JavaScript, Core Java, HTML5, CSS3  
-**Mobile:** Android Native (SDK), iOS Hybrid, Android/iOS cross-platform deployment  
+**Mobile:** Native Android (SDK), iOS Hybrid, Android/iOS cross-platform deployment  
 **Database:** MySQL, SQLite  
 **Tools & Platforms:** Android Studio, Visual Studio Code, Git  
-**OS:** Windows, macOS
+**OS:** Windows, macOS, ios, Android 
 
 ## Education
 
