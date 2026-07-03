@@ -1,0 +1,89 @@
+# Cursor Rules — JobApplybot
+
+## Python Standards
+
+- Target **Python 3.11+**; use `match/case`, `tomllib`, `ExceptionGroup`, and other modern built-ins where appropriate.
+- Prefer `pathlib.Path` over `os.path` for all filesystem operations.
+- Use **type hints everywhere** — function signatures, local variables where non-obvious, and return types.
+- Use `dataclasses` or `pydantic` models instead of plain dicts for structured data.
+- Prefer `async/await` with `asyncio` for I/O-bound work; never block the event loop.
+- Use f-strings; avoid `%`-formatting and `.format()`.
+- Follow PEP 8. Max line length: 100 characters.
+
+## Error Handling
+
+- Never use bare `except:`; always catch specific exception types.
+- Always log errors with full context before re-raising or handling.
+- Wrap external I/O (HTTP calls, file reads, browser actions) in try/except with descriptive messages.
+- Propagate meaningful errors upward; avoid silently swallowing exceptions.
+- Use custom exception classes (subclassing `Exception`) for domain-specific errors.
+
+```python
+# ❌ BAD
+try:
+    page.click("#submit")
+except:
+    pass
+
+# ✅ GOOD
+try:
+    await page.click("#submit", timeout=5000)
+except PlaywrightTimeoutError as e:
+    logger.error("Submit button not found within timeout", extra={"url": page.url})
+    raise JobApplicationError("Failed to submit application") from e
+```
+
+## Task Decomposition — Playwright & Automation
+
+Break every automation objective into **small, independently testable steps**:
+
+1. **Navigate** — go to the target URL and verify the page loaded.
+2. **Locate** — find the element (prefer `get_by_role`, `get_by_label`, `get_by_text` over CSS selectors).
+3. **Interact** — perform the single action (click, fill, select).
+4. **Assert** — verify the expected state before moving to the next step.
+5. **Recover** — handle failures locally (retry once, take a screenshot, raise).
+
+Each step should be its own function or clearly named block. Never chain multiple actions without intermediate checks.
+
+```python
+# ❌ BAD — one monolithic block
+async def apply_to_job(page, job_url):
+    await page.goto(job_url)
+    await page.click("#apply-btn")
+    await page.fill("#name", "John")
+    await page.click("#submit")
+
+# ✅ GOOD — decomposed steps
+async def navigate_to_job(page: Page, url: str) -> None:
+    await page.goto(url)
+    await expect(page).to_have_url(re.compile(r"jobs/"))
+
+async def open_application_form(page: Page) -> None:
+    await page.get_by_role("button", name="Apply").click()
+    await expect(page.get_by_role("form")).to_be_visible()
+
+async def fill_personal_details(page: Page, applicant: Applicant) -> None:
+    await page.get_by_label("Full name").fill(applicant.name)
+    await page.get_by_label("Email").fill(applicant.email)
+
+async def submit_application(page: Page) -> None:
+    await page.get_by_role("button", name="Submit").click()
+    await expect(page.get_by_text("Application sent")).to_be_visible(timeout=10_000)
+```
+
+## Playwright-Specific Rules
+
+- Always use **async Playwright** (`playwright.async_api`).
+- Prefer `get_by_role`, `get_by_label`, `get_by_placeholder`, `get_by_text` over CSS/XPath.
+- Set explicit `timeout` values on actions that could be slow; never rely solely on defaults.
+- Take a screenshot on every failure for debugging: `await page.screenshot(path="error.png")`.
+- Use `expect()` assertions (Playwright's built-in) for element state checks, not manual `sleep`.
+- Run browser in headless mode by default; expose a `--headed` flag for local debugging.
+
+## General Agent Behaviour
+
+- Before implementing, restate the objective as a numbered list of subtasks.
+- Implement one subtask at a time; confirm it works before proceeding.
+- Add a docstring to every function explaining **why**, not just what.
+- Prefer small, composable functions (≤ 30 lines) over large monoliths.
+- Write tests alongside new code when practical (use `pytest` + `pytest-asyncio`).
