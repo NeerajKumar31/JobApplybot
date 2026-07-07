@@ -1,15 +1,16 @@
-"""JobApplybot — LinkedIn + Indeed simultaneous Easy Apply with LLM resume tailoring.
+"""JobApplybot — LinkedIn + Indeed + Naukri simultaneous Easy Apply with LLM resume tailoring.
 
 Usage:
-    python main.py                          # run both portals (use .env flags to enable)
+    python main.py                          # run all enabled portals simultaneously
     python main.py --dry-run                # search + rewrite, no Submit
     python main.py --max-jobs 5             # override max jobs per portal
     python main.py --query "Backend Engineer"
     python main.py --remote                 # filter to remote jobs only
     python main.py --headed                 # show browser windows
     python main.py --status                 # show application summary and exit
-    python main.py --linkedin-only          # skip Indeed
-    python main.py --indeed-only            # skip LinkedIn
+    python main.py --linkedin-only          # run LinkedIn only
+    python main.py --indeed-only            # run Indeed only
+    python main.py --naukri-only            # run Naukri only
 """
 
 import argparse
@@ -26,6 +27,8 @@ from src.indeed import IndeedAuth, IndeedEasyApplyHandler, IndeedJobSearcher
 from src.indeed.easy_apply import AlreadyAppliedError as IndeedAlreadyAppliedError
 from src.linkedin import EasyApplyHandler, JobSearcher, LinkedInAuth
 from src.linkedin.easy_apply import AlreadyAppliedError as LinkedInAlreadyAppliedError
+from src.naukri import NaukriAuth, NaukriEasyApplyHandler, NaukriJobSearcher
+from src.naukri import NaukriAlreadyAppliedError
 from src.llm import CoverLetterGenerator, OllamaClient, ResumeRewriter
 from src.models.applicant import Applicant
 from src.models.job import Job, JobStatus
@@ -295,6 +298,96 @@ async def run_indeed(
     return applied_count
 
 
+# ── Naukri pipeline ────────────────────────────────────────────────────────────
+
+
+async def run_naukri(
+    settings: Settings,
+    ollama: OllamaClient,
+    tracker: AppliedJobsTracker,
+    applicant: Applicant,
+    base_resume: str,
+    dry_run: bool,
+) -> int:
+    """Full Naukri pipeline. Returns number of applications submitted."""
+    logger.info("Naukri: pipeline starting")
+    applied_count = 0
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=settings.headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
+        page = await context.new_page()
+
+        try:
+            auth = NaukriAuth(page, context)
+            await auth.login_with_session(
+                settings.naukri_email,
+                settings.naukri_password,
+                settings.data_dir / "naukri_cookies.json",
+            )
+        except Exception as e:
+            logger.error(f"Naukri: login failed — {e}")
+            await browser.close()
+            return 0
+
+        searcher = NaukriJobSearcher(page)
+        jobs = await searcher.search(
+            query=settings.search_query,
+            location=settings.search_location,
+            max_jobs=settings.max_jobs,
+            date_posted=settings.date_posted,
+        )
+        logger.info(f"Naukri: found {len(jobs)} jobs")
+
+        if not jobs:
+            logger.warning("Naukri: no jobs found")
+            await browser.close()
+            return 0
+
+        rewriter   = ResumeRewriter(ollama)
+        cover_gen  = CoverLetterGenerator(ollama) if settings.generate_cover_letter else None
+        ea_handler = NaukriEasyApplyHandler(page, applicant, llm=ollama)
+
+        for job in jobs:
+            if tracker.already_processed(job.job_id, source="naukri"):
+                logger.info(f"Naukri: skipping already-processed job {job.job_id}")
+                continue
+
+            await process_job(
+                job=job,
+                source="naukri",
+                base_resume=base_resume,
+                rewriter=rewriter,
+                cover_gen=cover_gen,
+                easy_apply=ea_handler,
+                applicant=applicant,
+                tracker=tracker,
+                data_dir=settings.data_dir,
+                dry_run=dry_run,
+                already_applied_error_type=NaukriAlreadyAppliedError,
+            )
+            if job.status == JobStatus.APPLIED:
+                applied_count += 1
+
+            await asyncio.sleep(random.uniform(8, 18))
+
+        await browser.close()
+
+    logger.info(f"Naukri: pipeline done — applied={applied_count}")
+    return applied_count
+
+
 # ── Orchestrator: run portals simultaneously ───────────────────────────────────
 
 
@@ -303,14 +396,16 @@ async def run(
     dry_run: bool,
     run_li: bool = True,
     run_in: bool = True,
+    run_nk: bool = True,
 ) -> None:
-    """Launch LinkedIn and/or Indeed pipelines, sharing a single OllamaClient."""
+    """Launch LinkedIn, Indeed, and/or Naukri pipelines simultaneously."""
     setup_logger(settings.data_dir)
     logger.info(
         f"JobApplybot starting | query='{settings.search_query}' "
         f"location='{settings.search_location}' dry_run={dry_run} "
         f"linkedin={run_li and settings.linkedin_enabled} "
-        f"indeed={run_in and settings.indeed_enabled}"
+        f"indeed={run_in and settings.indeed_enabled} "
+        f"naukri={run_nk and settings.naukri_enabled}"
     )
 
     base_resume = settings.resume_base_path.read_text(encoding="utf-8")
@@ -330,23 +425,28 @@ async def run(
             )
             sys.exit(1)
 
-        tasks = []
+        portal_tasks: list[tuple[str, any]] = []
         if run_li and settings.linkedin_enabled:
-            tasks.append(run_linkedin(settings, ollama, tracker, applicant, base_resume, dry_run))
+            portal_tasks.append(("LinkedIn", run_linkedin(settings, ollama, tracker, applicant, base_resume, dry_run)))
         if run_in and settings.indeed_enabled:
-            tasks.append(run_indeed(settings, ollama, tracker, applicant, base_resume, dry_run))
+            portal_tasks.append(("Indeed",   run_indeed(settings, ollama, tracker, applicant, base_resume, dry_run)))
+        if run_nk and settings.naukri_enabled:
+            portal_tasks.append(("Naukri",   run_naukri(settings, ollama, tracker, applicant, base_resume, dry_run)))
 
-        if not tasks:
-            logger.warning("No portals enabled — set LINKEDIN_ENABLED=true or INDEED_ENABLED=true in .env")
+        if not portal_tasks:
+            logger.warning(
+                "No portals enabled — set LINKEDIN_ENABLED, INDEED_ENABLED, "
+                "or NAUKRI_ENABLED=true in .env"
+            )
             return
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        names, coros = zip(*portal_tasks)
+        results = await asyncio.gather(*coros, return_exceptions=True)
 
         total_applied = 0
-        for i, result in enumerate(results):
+        for name, result in zip(names, results):
             if isinstance(result, Exception):
-                portal = ["LinkedIn", "Indeed"][i] if len(tasks) > 1 else "Portal"
-                logger.error(f"{portal} pipeline crashed: {result}")
+                logger.error(f"{name} pipeline crashed: {result}")
             else:
                 total_applied += result
 
@@ -386,6 +486,7 @@ def show_status() -> None:
     print(f"  Total tracked : {total}")
     print(f"  LinkedIn      : {by_src.get('linkedin', 0)}")
     print(f"  Indeed        : {by_src.get('indeed', 0)}")
+    print(f"  Naukri        : {by_src.get('naukri', 0)}")
     print()
     icons = {"applied": "✅", "failed": "❌", "skipped": "⏭ ", "found": "🔍"}
     for status in ["applied", "failed", "skipped", "found"]:
@@ -438,6 +539,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status",        action="store_true", help="Show status and exit")
     parser.add_argument("--linkedin-only", action="store_true", help="Run LinkedIn only")
     parser.add_argument("--indeed-only",   action="store_true", help="Run Indeed only")
+    parser.add_argument("--naukri-only",   action="store_true", help="Run Naukri only")
     return parser.parse_args()
 
 
@@ -457,7 +559,9 @@ if __name__ == "__main__":
     if args.remote:       cfg.remote_filter   = "remote"
     if args.cover_letter: cfg.generate_cover_letter = True
 
-    run_li = not args.indeed_only
-    run_in = not args.linkedin_only
+    only_one = args.linkedin_only or args.indeed_only or args.naukri_only
+    run_li = args.linkedin_only or not only_one
+    run_in = args.indeed_only   or not only_one
+    run_nk = args.naukri_only   or not only_one
 
-    asyncio.run(run(cfg, dry_run=args.dry_run, run_li=run_li, run_in=run_in))
+    asyncio.run(run(cfg, dry_run=args.dry_run, run_li=run_li, run_in=run_in, run_nk=run_nk))

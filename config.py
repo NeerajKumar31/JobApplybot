@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     indeed_password: str = ""
     indeed_enabled: bool = False
 
+    # Naukri
+    naukri_email: str = ""
+    naukri_password: str = ""
+    naukri_enabled: bool = False
+
     # Ollama
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
