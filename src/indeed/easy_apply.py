@@ -72,8 +72,6 @@ class IndeedEasyApplyHandler:
         frame,           # FrameLocator or None (page-based)
     ) -> None:
         """Drive the multi-step apply form to completion."""
-        # When frame is None we wrap self._page in a thin adapter so the rest of
-        # the code works identically for both iframe and page-based flows.
         ctx = frame if frame is not None else _PageAsFrame(self._page)
 
         for step_num in range(1, MAX_STEPS + 1):
@@ -84,6 +82,9 @@ class IndeedEasyApplyHandler:
                 if frame is not None:
                     await self._close_modal()
                 return
+
+            # Pause if reCAPTCHA is blocking the form before we try to fill or click
+            await self._wait_for_captcha(job, step_num)
 
             await self._fill_step(ctx, job, resume_pdf_path, cover_letter)
 
@@ -100,17 +101,79 @@ class IndeedEasyApplyHandler:
             elif action == "continue":
                 await self._click_in_frame(ctx,
                     "Continue", "Next", "Continue to apply",
-                    "Review your application", "Next step")
+                    "Review your application", "Next step", "Save and continue")
             else:
-                screenshot = f"data/screenshots/indeed_stuck_{job.job_id}_step{step_num}.png"
-                await self._page.screenshot(path=screenshot)
-                raise IndeedApplyError(
-                    f"No action button on step {step_num}. Screenshot: {screenshot}"
-                )
+                # CAPTCHA may have appeared after fill — check once more before giving up
+                await self._wait_for_captcha(job, step_num, warn=False)
+                action = await self._detect_action(ctx)
+                if action in ("submit", "continue"):
+                    continue  # re-enter loop to click the now-visible button
+
+                try:
+                    screenshot = f"data/screenshots/indeed_stuck_{job.job_id}_step{step_num}.png"
+                    await self._page.screenshot(path=screenshot)
+                    raise IndeedApplyError(
+                        f"No action button on step {step_num}. Screenshot: {screenshot}"
+                    )
+                except IndeedApplyError:
+                    raise
+                except Exception:
+                    raise IndeedApplyError(
+                        f"No action button on step {step_num} (page may have closed)"
+                    )
 
             await asyncio.sleep(random.uniform(1.0, 2.0))
 
         raise IndeedApplyError(f"Exceeded {MAX_STEPS} steps — aborting")
+
+    async def _wait_for_captcha(
+        self, job: Job, step_num: int, warn: bool = True
+    ) -> bool:
+        """Detect reCAPTCHA / hCaptcha and wait up to 120 s for the user to solve it.
+
+        Returns True if a CAPTCHA was found (regardless of whether it was solved),
+        False if no CAPTCHA was present.
+        """
+        captcha_selectors = [
+            "iframe[src*='recaptcha']",
+            "iframe[title*='recaptcha' i]",
+            "div.g-recaptcha",
+            "iframe[src*='google.com/recaptcha']",
+            "iframe[src*='hcaptcha']",
+            "div.h-captcha",
+        ]
+
+        def _captcha_active() -> bool:
+            return False  # sync placeholder; actual check is async below
+
+        async def _has_captcha() -> bool:
+            for sel in captcha_selectors:
+                try:
+                    if await self._page.locator(sel).count() > 0:
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        if not await _has_captcha():
+            return False
+
+        if warn:
+            logger.warning(
+                f"Indeed: reCAPTCHA on apply step {step_num} for "
+                f"'{job.title} @ {job.company}'. "
+                "Solve it in the browser window — waiting up to 120 seconds…"
+            )
+
+        for _ in range(40):
+            await asyncio.sleep(3)
+            if not await _has_captcha():
+                logger.info("Indeed: CAPTCHA solved — resuming")
+                await asyncio.sleep(1)
+                return True
+
+        logger.warning("Indeed: CAPTCHA not solved in 120 s — continuing anyway")
+        return True
 
     # ── Guard: already applied ─────────────────────────────────────────────────
 

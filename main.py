@@ -94,7 +94,18 @@ async def process_job(
         logger.info(f"[{source}] Already applied to {job.job_id} — skipping")
         job.mark_skipped("already_applied")
     except Exception as e:
-        logger.error(f"[{source}] Easy Apply failed [{job.job_id}]: {e}")
+        err_str = str(e)
+        # Page/browser closed mid-apply (e.g. smartapply tab closed by Indeed)
+        if "closed" in err_str.lower() and (
+            "page" in err_str.lower() or "browser" in err_str.lower()
+            or "target" in err_str.lower()
+        ):
+            logger.warning(
+                f"[{source}] Apply tab closed unexpectedly for {job.job_id} — "
+                "marking failed so it will be retried next run"
+            )
+        else:
+            logger.error(f"[{source}] Easy Apply failed [{job.job_id}]: {e}")
         job.mark_failed(f"easy_apply: {e}")
 
     tracker.record(job, source=source)

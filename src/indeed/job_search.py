@@ -204,9 +204,32 @@ class IndeedJobSearcher:
                 "[class*='companyLocation']",
             ])
 
-            # Click card to load detail and get description + URL
+            # Click card to load detail panel
             await card.click()
             await asyncio.sleep(random.uniform(2, 3))
+            await self._dismiss_popups()
+
+            # Skip jobs that only offer external apply ("Apply on company site")
+            external_btn = self._page.locator(
+                "button:has-text('Apply on company site'), "
+                "a:has-text('Apply on company site'), "
+                "[data-testid='applyOnCompanySite'], "
+                "[aria-label*='Apply on company site']"
+            )
+            if await external_btn.count() > 0:
+                logger.debug(f"Indeed: skipping external-apply job {job_id} ({title})")
+                return None
+
+            # Also skip if no IndeedApply button is present at all
+            apply_btn = self._page.locator(
+                "button:has-text('Apply now'), "
+                "button#indeedApplyButton, "
+                "[data-testid='indeedApplyButton']"
+            )
+            if await apply_btn.count() == 0:
+                logger.debug(f"Indeed: skipping job {job_id} — no Apply now button")
+                return None
+
             description = await self._extract_description()
             job_url = self._page.url
 
