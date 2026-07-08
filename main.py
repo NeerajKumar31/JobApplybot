@@ -42,7 +42,7 @@ async def process_job(
     job: Job,
     source: str,
     base_resume: str,
-    rewriter: ResumeRewriter,
+    rewriter: ResumeRewriter | None,
     cover_gen: CoverLetterGenerator | None,
     easy_apply,
     applicant: Applicant,
@@ -53,19 +53,23 @@ async def process_job(
 ) -> None:
     """Rewrite resume → generate PDF → (cover letter) → Easy Apply → record.
 
-    `source` is 'linkedin' or 'indeed' and is passed to the tracker so IDs
-    from different portals never collide in applied_jobs.json.
+    `source` is 'linkedin', 'indeed', or 'naukri' and is passed to the tracker
+    so IDs from different portals never collide in applied_jobs.json.
+
+    When `rewriter` is None (Ollama offline), the base resume is used as-is.
     """
     logger.info(f"[{source}] Processing: {job.title} @ {job.company}")
 
-    try:
-        tailored_md, keywords = await rewriter.rewrite(job, base_resume)
-        job.keywords_extracted = keywords
-    except Exception as e:
-        logger.error(f"[{source}] Resume rewrite failed [{job.job_id}]: {e}")
-        job.mark_failed(f"resume_rewrite: {e}")
-        tracker.record(job, source=source)
-        return
+    if rewriter is not None:
+        try:
+            tailored_md, keywords = await rewriter.rewrite(job, base_resume)
+            job.keywords_extracted = keywords
+        except Exception as e:
+            logger.warning(f"[{source}] Resume rewrite failed [{job.job_id}]: {e} — using base resume")
+            tailored_md = base_resume
+    else:
+        logger.debug(f"[{source}] LLM offline — using base resume for {job.job_id}")
+        tailored_md = base_resume
 
     pdf_path = data_dir / "resumes" / f"{source}_{job.job_id}.pdf"
     try:
@@ -169,8 +173,8 @@ async def run_linkedin(
             await browser.close()
             return 0
 
-        rewriter   = ResumeRewriter(ollama)
-        cover_gen  = CoverLetterGenerator(ollama) if settings.generate_cover_letter else None
+        rewriter   = ResumeRewriter(ollama) if ollama is not None else None
+        cover_gen  = CoverLetterGenerator(ollama) if (ollama is not None and settings.generate_cover_letter) else None
         ea_handler = EasyApplyHandler(page, applicant, llm=ollama)
 
         for job in jobs:
@@ -265,8 +269,8 @@ async def run_indeed(
             await browser.close()
             return 0
 
-        rewriter   = ResumeRewriter(ollama)
-        cover_gen  = CoverLetterGenerator(ollama) if settings.generate_cover_letter else None
+        rewriter   = ResumeRewriter(ollama) if ollama is not None else None
+        cover_gen  = CoverLetterGenerator(ollama) if (ollama is not None and settings.generate_cover_letter) else None
         ea_handler = IndeedEasyApplyHandler(page, applicant, llm=ollama, context=context)
 
         for job in jobs:
@@ -355,8 +359,8 @@ async def run_naukri(
             await browser.close()
             return 0
 
-        rewriter   = ResumeRewriter(ollama)
-        cover_gen  = CoverLetterGenerator(ollama) if settings.generate_cover_letter else None
+        rewriter   = ResumeRewriter(ollama) if ollama is not None else None
+        cover_gen  = CoverLetterGenerator(ollama) if (ollama is not None and settings.generate_cover_letter) else None
         ea_handler = NaukriEasyApplyHandler(page, applicant, llm=ollama)
 
         for job in jobs:
@@ -418,12 +422,15 @@ async def run(
     )
 
     async with OllamaClient(settings.ollama_base_url, settings.ollama_model) as ollama:
-        if not await ollama.check_health():
-            logger.error(
-                f"Ollama is not ready. Run `ollama serve` and ensure "
-                f"'{settings.ollama_model}' is pulled."
+        ollama_ok = await ollama.check_health()
+        if not ollama_ok:
+            logger.warning(
+                f"Ollama is not reachable ({settings.ollama_base_url}). "
+                "Continuing WITHOUT LLM — base resume will be used as-is, "
+                "no resume tailoring or cover letters. "
+                "To enable LLM: run `ollama serve` and pull your model."
             )
-            sys.exit(1)
+            ollama = None  # pipelines check for None and skip rewriting
 
         portal_tasks: list[tuple[str, any]] = []
         if run_li and settings.linkedin_enabled:
