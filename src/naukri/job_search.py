@@ -68,10 +68,12 @@ class NaukriJobSearcher:
         experience: int,
         date_posted: str,
     ) -> str:
-        # Naukri uses slug-style URLs: /[keyword]-jobs[?params]
+        # Naukri slug format: /[keyword]-jobs-in-[location]
         slug = query.lower().replace(" ", "-")
-        params: dict[str, str] = {}
+        loc_slug = location.lower().replace(" ", "-") if location else ""
+        job_path = f"{slug}-jobs-in-{loc_slug}" if loc_slug else f"{slug}-jobs"
 
+        params: dict[str, str] = {}
         if experience:
             params["experience"] = str(experience)
 
@@ -81,7 +83,7 @@ class NaukriJobSearcher:
             params["jobAge"] = _age_map[date_posted]
 
         qs = f"?{urllib.parse.urlencode(params)}" if params else ""
-        return f"{self._BASE}/{slug}-jobs{qs}"
+        return f"{self._BASE}/{job_path}{qs}"
 
     # ── Popup dismissal ────────────────────────────────────────────────────────
 
