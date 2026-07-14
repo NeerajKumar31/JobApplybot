@@ -22,6 +22,17 @@ class Settings(BaseSettings):
     naukri_email: str = ""
     naukri_password: str = ""
     naukri_enabled: bool = False
+    # Comma-separated queries run only on Naukri (overrides search_query for Naukri).
+    # Leave blank to use the shared search_query instead.
+    # Example: "Mobile Developer,Angular Developer,Frontend Developer"
+    naukri_queries: str = ""
+
+    @property
+    def naukri_query_list(self) -> list[str]:
+        """Return Naukri-specific queries, or the shared query as a single-item list."""
+        if self.naukri_queries.strip():
+            return [q.strip() for q in self.naukri_queries.split(",") if q.strip()]
+        return [self.search_query]
 
     # Ollama
     ollama_base_url: str = "http://localhost:11434"

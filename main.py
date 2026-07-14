@@ -345,17 +345,46 @@ async def run_naukri(
             await browser.close()
             return 0
 
-        searcher = NaukriJobSearcher(page)
-        jobs = await searcher.search(
-            query=settings.search_query,
-            location=settings.search_location,
-            max_jobs=settings.max_jobs,
-            date_posted=settings.date_posted,
-        )
-        logger.info(f"Naukri: found {len(jobs)} jobs")
+        searcher   = NaukriJobSearcher(page)
+        queries    = settings.naukri_query_list
+        seen_ids: set[str] = set()
+        all_jobs:  list[Job] = []
+
+        jobs_per_query = max(1, settings.max_jobs // len(queries))
+
+        for query in queries:
+            logger.info(f"Naukri: searching '{query}' in {settings.search_location}")
+            found = await searcher.search(
+                query=query,
+                location=settings.search_location,
+                max_jobs=jobs_per_query,
+                date_posted=settings.date_posted,
+            )
+            new = [j for j in found if j.job_id not in seen_ids]
+            seen_ids.update(j.job_id for j in new)
+            all_jobs.extend(new)
+            logger.info(f"Naukri: '{query}' → {len(new)} new jobs (total {len(all_jobs)})")
+
+        # Relevance filter: keep only jobs whose title matches at least one keyword
+        _RELEVANT_KEYWORDS = [kw.lower() for kw in queries] + [
+            "mobile", "android", "ios", "react native", "ionic",
+            "angular", "frontend", "front-end", "front end",
+            "flutter", "cordova", "hybrid",
+        ]
+
+        def _is_relevant(job: Job) -> bool:
+            title = job.title.lower()
+            return any(kw in title for kw in _RELEVANT_KEYWORDS)
+
+        jobs = [j for j in all_jobs if _is_relevant(j)]
+        skipped = len(all_jobs) - len(jobs)
+        if skipped:
+            logger.info(f"Naukri: filtered out {skipped} irrelevant jobs — {len(jobs)} remain")
+
+        logger.info(f"Naukri: found {len(jobs)} relevant jobs")
 
         if not jobs:
-            logger.warning("Naukri: no jobs found")
+            logger.warning("Naukri: no relevant jobs found")
             await browser.close()
             return 0
 
